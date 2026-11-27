@@ -1,8 +1,5 @@
 {
   "rewrites": [
-    { "source": "/api/trailers/proxy/status", "destination": "/api/index.js" },
-    { "source": "/api/trailers/:code", "destination": "/api/index.js" },
-    { "source": "/api/actors", "destination": "/api/index.js" },
-    { "source": "/proxy", "destination": "/api/index.js" }
+    { "source": "/(.*)", "destination": "/api/index.js" }
   ]
 }
