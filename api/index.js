@@ -4,6 +4,55 @@ export const config = {
 };
 
 const SECRET_TOKEN = "MY_TOKEN_123";
+const UPSTREAM_SCRIPT_URL = "https://greasyfork.org";
+
+// 記憶體快取：自動從腳本 4 同步最新網域與 Token（每 1 小時更新一次）
+let cachedUpstream = { host: "", token: "", ts: 0 };
+
+async function getDynamicUpstreamConfig() {
+  const now = Date.now();
+  if (cachedUpstream.host && cachedUpstream.token && now - cachedUpstream.ts < 3600000) {
+    return cachedUpstream;
+  }
+
+  try {
+    const res = await fetch(UPSTREAM_SCRIPT_URL, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (res.ok) {
+      const code = await res.text();
+      // 提取腳本 4 裡的 host 陣列與 token 陣列（XOR 37 編碼）
+      const hostMatch = code.match(/host:String\.fromCharCode\.apply\(null,\[([\d,\s]+)\]\)/);
+      const tokenMatch = code.match(/token\(\)\{return\[([\d,\s]+)\]\.map/);
+
+      if (hostMatch && tokenMatch) {
+        const decodeXor37 = (csv) =>
+          csv
+            .split(",")
+            .map((n) => String.fromCharCode(Number(n.trim()) ^ 37))
+            .join("");
+
+        const host = hostMatch.at(1)
+          .split(",")
+          .map((n) => String.fromCharCode(Number(n.trim())))
+          .join("");
+        const token = decodeXor37(tokenMatch.at(1));
+
+        if (host && token) {
+          cachedUpstream = { host, token, ts: now };
+          return cachedUpstream;
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 若 GreasyFork 暫時無法連線，回退至目前已知有效設定
+  return {
+    host: cachedUpstream.host || "javxy.cc.cd",
+    token: cachedUpstream.token || "AmdNGl8XOlAFBB6B7cL36aT3U+560/12F4j83eZ",
+    ts: now,
+  };
+}
 
 export default async function handler(request) {
   const url = new URL(request.url);
@@ -17,28 +66,42 @@ export default async function handler(request) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 1. 演員三圍資料介面：POST /api/actors
+  // 1. 演員三圍資料介面（自動同步腳本 4 最新 API 轉發）
   if (url.pathname === "/api/actors") {
     if (request.headers.get("X-Javxy-Token") !== SECRET_TOKEN) {
       return jsonOut({ error: "Unauthorized" }, 401, corsHeaders);
     }
-    let body = {};
+
+    const bodyText = await request.text();
+    const upstream = await getDynamicUpstreamConfig();
+    const principal = request.headers.get("X-Javxy-Principal") || `anon_${Date.now().toString(36)}`;
+
     try {
-      body = await request.json();
-    } catch {}
-    const names = Array.isArray(body.names) ? body.names.slice(0, 15) : [];
-    const profiles = await Promise.all(
-      names.map(async (rawName) => {
-        const name = String(rawName || "").trim();
-        if (!name) return { name: rawName, error: "empty" };
-        const profile = await fetchActorProfile(name);
-        return profile ? { name, profile } : { name, error: "not_found" };
-      })
-    );
-    return jsonOut({ profiles }, 200, {
-      ...corsHeaders,
-      "Cache-Control": "public, max-age=86400",
-    });
+      const upRes = await fetch(`https://${upstream.host}/api/actors?client=laosiji-new`, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json,text/plain,*/*",
+          "Content-Type": "application/json",
+          "X-Javxy-Token": upstream.token,
+          "X-Javxy-Principal": principal,
+        },
+        body: bodyText,
+      });
+
+      if (upRes.ok) {
+        const data = await upRes.text();
+        return new Response(data, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "public, max-age=86400",
+            ...corsHeaders,
+          },
+        });
+      }
+    } catch (e) {}
+
+    return jsonOut({ profiles: [] }, 200, corsHeaders);
   }
 
   // 2. 中轉狀態檢查
@@ -46,7 +109,7 @@ export default async function handler(request) {
     return jsonOut({ enabled: true }, 200, corsHeaders);
   }
 
-  // 3. 串流反向代理：/proxy?token=MY_TOKEN_123&url=...
+  // 3. 串流反向代理（支援動態 Referer 與 HLS 加密金鑰轉發）
   if (url.pathname === "/proxy") {
     const qToken = url.searchParams.get("token");
     const hToken = request.headers.get("X-Javxy-Token");
@@ -60,7 +123,7 @@ export default async function handler(request) {
     return proxyStream(request, url.origin, targetUrl, corsHeaders);
   }
 
-  // 4. 預告片查詢：/api/trailers/:code
+  // 4. 預告片查詢（優先轉發腳本 4 最新聚合源，失敗時自動回退 JavTrailers）
   const segs = url.pathname.split("/").filter(Boolean);
   if (segs.at(0) !== "api" || segs.at(1) !== "trailers" || !segs.at(2)) {
     return jsonOut({ error: "Not Found" }, 404, corsHeaders);
@@ -71,8 +134,36 @@ export default async function handler(request) {
   }
 
   const code = decodeURIComponent(segs.at(2)).trim().toUpperCase();
-  const rawVideoUrl = await fetchFromJavTrailers(code);
+  const upstream = await getDynamicUpstreamConfig();
+  const principal = request.headers.get("X-Javxy-Principal") || `anon_${Date.now().toString(36)}`;
 
+  try {
+    const upUrl = new URL(`https://${upstream.host}/api/trailers/${encodeURIComponent(code)}`);
+    url.searchParams.forEach((v, k) => upUrl.searchParams.set(k, v));
+    upUrl.searchParams.set("client", "laosiji-new");
+
+    const upRes = await fetch(upUrl.href, {
+      headers: {
+        "Accept": "application/json,text/plain,*/*",
+        "X-Javxy-Token": upstream.token,
+        "X-Javxy-Principal": principal,
+      },
+    });
+
+    if (upRes.ok) {
+      const data = await upRes.text();
+      return new Response(data, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          ...corsHeaders,
+        },
+      });
+    }
+  } catch (e) {}
+
+  // 備援：若上游無結果，改用本地 JavTrailers 抓取
+  const rawVideoUrl = await fetchFromJavTrailers(code);
   if (!rawVideoUrl) {
     return jsonOut({ error: "Trailer not found", code }, 404, corsHeaders);
   }
@@ -95,144 +186,7 @@ export default async function handler(request) {
   );
 }
 
-// 演員資料查詢：JAVDatabase & AVWikiDB WordPress JSON API
-async function fetchActorProfile(name) {
-  const headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "ja,zh-TW;q=0.9,en-US;q=0.8",
-  };
-
-  const toJpKanji = (s) => {
-    const map = {
-      "亞": "亜", "澤": "沢", "櫻": "桜", "遙": "遥", "凜": "凛",
-      "惠": "恵", "眞": "真", "實": "実", "廣": "広", "瀨": "瀬",
-      "邊": "辺", "齋": "斎", "齊": "斉", "筱": "篠", "繪": "絵",
-      "戀": "恋", "黑": "黒", "濱": "浜", "淺": "浅"
-    };
-    return String(s || "").split("").map((ch) => map[ch] || ch).join("");
-  };
-
-  const aliasMap = {
-    "河北彩花": "河北彩伽",
-    "橋本有菜": "新ありな",
-    "橋本ありな": "新ありな",
-    "深田詠美": "深田えいみ",
-    "明日花綺羅": "明日花キララ",
-    "桃乃木香奈": "桃乃木かな",
-    "相澤南": "相沢みなみ",
-    "明里紬": "明里つむぎ",
-    "楓可憐": "楓カレン",
-    "田中檸檬": "楓カレン",
-    "涼森玲夢": "涼森れむ",
-    "八掛海": "八掛うみ",
-    "七澤米亞": "七沢みあ",
-  };
-
-  const jpName = toJpKanji(name);
-  const namesToTry = [...new Set([name, jpName, aliasMap[name], aliasMap[jpName]].filter(Boolean))];
-
-  const extractProfileFromText = (rawHtml) => {
-    const text = String(rawHtml || "")
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;|&#8211;|&#8212;/g, " ")
-      .replace(/\s+/g, " ");
-
-    const profile = { name };
-
-    const bMatch =
-      text.match(/(?:DOB|Birthday|生年月日|誕生日)\s*[:：]?\s*(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/i) ||
-      text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
-    if (bMatch) {
-      profile.birthday = `${bMatch.at(1)}-${bMatch.at(2).padStart(2, "0")}-${bMatch.at(3).padStart(2, "0")}`;
-    }
-
-    const hMatch =
-      text.match(/(?:Height|身長|T)\s*[:：]?\s*(1[4-8]\d)\s*cm/i) ||
-      text.match(/\b(1[4-8]\d)\s*cm\b/i);
-    if (hMatch) profile.heightCm = hMatch.at(1);
-
-    const wMatch = text.match(/(?:Weight|体重|W)\s*[:：]?\s*(\d{2,3})\s*kg/i);
-    if (wMatch) profile.weightKg = wMatch.at(1);
-
-    const bwhMatch =
-      text.match(/(?:Measurements|スリーサイズ)\s*[:：]?\s*(\d{2,3})\s*[-/／]\s*(\d{2,3})\s*[-/／]\s*(\d{2,3})/i) ||
-      text.match(/B\s*(\d{2,3})\s*(?:[（(]([A-Z])[）)])?\s*[-/／・\s]+W\s*(\d{2,3})\s*[-/／・\s]+H\s*(\d{2,3})/i);
-    if (bwhMatch) {
-      if (bwhMatch.length >= 5 && bwhMatch.at(2) && /^[A-Z]$/i.test(bwhMatch.at(2))) {
-        profile.bustCm = bwhMatch.at(1);
-        profile.cup = bwhMatch.at(2).toUpperCase();
-        profile.waistCm = bwhMatch.at(3);
-        profile.hipCm = bwhMatch.at(4);
-      } else {
-        profile.bustCm = bwhMatch.at(1);
-        profile.waistCm = bwhMatch.at(2);
-        profile.hipCm = bwhMatch.at(3);
-      }
-    }
-
-    if (!profile.cup) {
-      const cMatch =
-        text.match(/Cup\s*[:：]?\s*([A-Z])\b/i) ||
-        text.match(/[（(]([A-Z])\s*カップ[）)]|([A-Z])\s*カップ/i);
-      if (cMatch) profile.cup = (cMatch.at(1) || cMatch.at(2) || "").toUpperCase();
-    }
-
-    const bloodMatch = text.match(/(?:Blood\s*Type|血液型)\s*[:：]?\s*(AB|A|B|O)\s*型?/i);
-    if (bloodMatch) profile.bloodType = bloodMatch.at(1).toUpperCase();
-
-    return profile.birthday || profile.heightCm || profile.bustCm ? profile : null;
-  };
-    for (const kw of namesToTry) {
-    // 來源 1：JAVDatabase WordPress JSON API
-    try {
-      const res = await fetch(
-        `https://javdatabase.com{encodeURIComponent(kw)}&per_page=5`,
-        { headers }
-      );
-      if (res.ok) {
-        const list = await res.json();
-        if (Array.isArray(list) && list.length > 0) {
-          for (const item of list) {
-            const hit = extractProfileFromText(JSON.stringify(item));
-            if (hit) return hit;
-            if (item?.link) {
-              const dRes = await fetch(item.link, { headers });
-              if (dRes.ok) {
-                const dHit = extractProfileFromText(await dRes.text());
-                if (dHit) return dHit;
-              }
-            }
-          }
-        }
-      }
-    } catch {}
-
-    // 來源 2：AVWikiDB WordPress JSON API
-    try {
-      const res = await fetch(
-        `https://avwikidb.com{encodeURIComponent(kw)}&per_page=5`,
-        { headers }
-      );
-      if (res.ok) {
-        const list = await res.json();
-        if (Array.isArray(list) && list.length > 0) {
-          for (const item of list) {
-            const htmlContent = item?.content?.rendered || JSON.stringify(item);
-            const hit = extractProfileFromText(htmlContent);
-            if (hit) return hit;
-          }
-        }
-      }
-    } catch {}
-  }
-
-  return null;
-}
-
-// 串流反向代理（支援動態 Referer 與 HLS 加密金鑰轉發）
+// 串流反向代理
 async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
   const targetObj = new URL(targetUrl);
   const reqHeaders = new Headers();
@@ -241,7 +195,6 @@ async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
 
-  // 依據影片實際主機動態設定 Referer，避免被 DMM 或其他 CDN 阻擋
   if (targetObj.hostname.includes("dmm.co.jp")) {
     reqHeaders.set("Referer", "https://dmm.co.jp");
   } else {
@@ -268,7 +221,6 @@ async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
       .map((line) => {
         const trimmed = line.trim();
         if (!trimmed) return line;
-        // 轉發 #EXT-X-KEY 或 #EXT-X-MAP 標籤內的 URI 加密金鑰與初始化片段
         if (trimmed.startsWith("#")) {
           return line.replace(/URI="([^"]+)"/gi, (_, uri) => `URI="${toProxy(uri)}"`);
         }
@@ -288,7 +240,8 @@ async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
   outHeaders.set("Cache-Control", "public, max-age=86400");
   return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
 }
-// 抓取 JavTrailers 預告片
+
+// 備援抓取 JavTrailers 預告片
 async function fetchFromJavTrailers(code) {
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -336,4 +289,3 @@ function jsonOut(obj, status = 200, extraHeaders = {}) {
     headers: { "Content-Type": "application/json; charset=utf-8", ...extraHeaders },
   });
 }
-
