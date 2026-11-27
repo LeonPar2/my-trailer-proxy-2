@@ -17,15 +17,13 @@ export default async function handler(request) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 新增：演員三圍資料介面 POST /api/actors
+  // 1. 演員三圍資料介面
   if (url.pathname === "/api/actors") {
     if (request.headers.get("X-Javxy-Token") !== SECRET_TOKEN) {
       return jsonOut({ error: "Unauthorized" }, 401, corsHeaders);
     }
     let body = {};
-    try {
-      body = await request.json();
-    } catch {}
+    try { body = await request.json(); } catch {}
     const names = Array.isArray(body.names) ? body.names.slice(0, 10) : [];
     const profiles = await Promise.all(names.map(async function (rawName) {
       const name = String(rawName || "").trim();
@@ -39,12 +37,16 @@ export default async function handler(request) {
     });
   }
 
+  // 2. 中轉狀態檢查
   if (url.pathname === "/api/trailers/proxy/status") {
     return jsonOut({ enabled: true }, 200, corsHeaders);
   }
 
+  // 3. 串流反向代理（支援 query token 與 header token 雙重驗證）
   if (url.pathname === "/proxy") {
-    if (url.searchParams.get("token") !== SECRET_TOKEN) {
+    const qToken = url.searchParams.get("token");
+    const hToken = request.headers.get("X-Javxy-Token");
+    if (qToken !== SECRET_TOKEN && hToken !== SECRET_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
     const targetUrl = url.searchParams.get("url");
@@ -54,6 +56,7 @@ export default async function handler(request) {
     return proxyStream(request, url.origin, targetUrl, corsHeaders);
   }
 
+  // 4. 預告片查詢
   const segs = url.pathname.split("/").filter(Boolean);
   const p1 = segs.shift();
   const p2 = segs.shift();
@@ -90,7 +93,6 @@ export default async function handler(request) {
   }, 200, corsHeaders);
 }
 
-// 新增：從 SeesaaWiki 抓取演員生日、身高、三圍與罩杯
 async function fetchActorFromSeesaa(name) {
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
