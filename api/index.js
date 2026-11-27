@@ -146,7 +146,7 @@ async function fetchActorMultiSource(name) {
   for (const kw of namesToTry) {
     // 來源 1：AVWikiDB（全 UTF-8 編碼，直接支援日文漢字）
     try {
-      const avwHost = "https://" + "avwikidb.com";
+      const avwHost = "https://avwikidb.com";
       const sRes = await fetch(avwHost + "/?s=" + encodeURIComponent(kw), { headers: headers });
       if (sRes.ok) {
         const sHtml = await sRes.text();
@@ -162,10 +162,9 @@ async function fetchActorMultiSource(name) {
         }
       }
     } catch (e) {}
-
     // 來源 2：Minnano-AV（日文老牌資料庫）
     try {
-      const mnvHost = "https://" + "://minnano-av.com";
+      const mnvHost = "https://minnano-av.com";
       const sRes = await fetch(mnvHost + "/search_result.php?search_scope=actress&search_word=" + encodeURIComponent(kw), { headers: headers });
       if (sRes.ok) {
         const sHtml = await sRes.text();
@@ -186,62 +185,7 @@ async function fetchActorMultiSource(name) {
 
     // 來源 3：JAVDatabase（英文/漢字雙支援）
     try {
-      const jdbHost = "https://" + "://javdatabase.com";
-      const sRes = await fetch(jdbHost + "/idols/?_idol_search=" + encodeURIComponent(kw), { headers: headers });
-      if (sRes.ok) {
-        const sHtml = await sRes.text();
-        const idx = sHtml.indexOf("/idols/");
-        if (idx !== -1) {
-          let endIdx = idx + 7;
-          while (endIdx < sHtml.length && "\"'?# >".indexOf(sHtml.charAt(endIdx)) === -1) endIdx++;
-          const slug = sHtml.slice(idx, endIdx);
-          if (slug.length > 8) {
-            const dRes = await fetch(jdbHost + slug, { headers: headers });
-            if (dRes.ok) {
-              const dHtml = await dRes.text();
-              const text = dHtml.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
-              const profile = { name: name };
-              const bMatch = text.match(/DOB:\s*(\d{4}-\d{2}-\d{2})/i);
-              if (bMatch) profile.birthday = bMatch.at(1);
-              const hMatch = text.match(/Height:\s*(\d{3})\s*cm/i);
-              if (hMatch) profile.heightCm = hMatch.at(1);
-              const mMatch = text.match(/Measurements:\s*(\d{2,3})-(\d{2,3})-(\d{2,3})/i);
-              if (mMatch) { profile.bustCm = mMatch.at(1); profile.waistCm = mMatch.at(2); profile.hipCm = mMatch.at(3); }
-              const cMatch = text.match(/Cup:\s*([A-Z])/i);
-              if (cMatch) profile.cup = cMatch.at(1).toUpperCase();
-              if (profile.birthday || profile.heightCm || profile.bustCm) return profile;
-            }
-          }
-        }
-      }
-    } catch (e) {}
-  }
-  return null;
-}
-    // 來源 2：Minnano-AV（日文老牌資料庫）
-    try {
-      const mnvHost = "https://" + "://minnano-av.com";
-      const sRes = await fetch(mnvHost + "/search_result.php?search_scope=actress&search_word=" + encodeURIComponent(kw), { headers: headers });
-      if (sRes.ok) {
-        const sHtml = await sRes.text();
-        const idx = sHtml.indexOf("actress");
-        if (idx !== -1 && sHtml.indexOf(".html", idx) !== -1) {
-          const start = sHtml.lastIndexOf("/", idx);
-          const end = sHtml.indexOf(".html", idx) + 5;
-          if (start !== -1) {
-            const dRes = await fetch(mnvHost + sHtml.slice(start, end), { headers: headers });
-            if (dRes.ok) {
-              const hit = parseJapaneseHtml(await dRes.text());
-              if (hit) return hit;
-            }
-          }
-        }
-      }
-    } catch (e) {}
-
-    // 來源 3：JAVDatabase（英文/漢字雙支援）
-    try {
-      const jdbHost = "https://" + "://javdatabase.com";
+      const jdbHost = "https://javdatabase.com";
       const sRes = await fetch(jdbHost + "/idols/?_idol_search=" + encodeURIComponent(kw), { headers: headers });
       if (sRes.ok) {
         const sHtml = await sRes.text();
@@ -277,7 +221,7 @@ async function fetchActorMultiSource(name) {
 async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
   const reqHeaders = new Headers();
   reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
-  reqHeaders.set("Referer", "https://" + "javtrailers.com" + "/");
+  reqHeaders.set("Referer", "https://javtrailers.com");
   const range = request.headers.get("Range");
   if (range) reqHeaders.set("Range", range);
 
@@ -314,7 +258,7 @@ async function fetchFromJavTrailers(code) {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept-Language": "ja,en-US;q=0.9",
   };
-  const host = "https://" + "javtrailers.com";
+  const host = "https://javtrailers.com";
   const sRes = await fetch(host + "/search/" + encodeURIComponent(code), { headers: headers });
   if (!sRes.ok) return null;
 
