@@ -4,53 +4,85 @@ export const config = {
 };
 
 const SECRET_TOKEN = "MY_TOKEN_123";
-const UPSTREAM_SCRIPT_URL = "https://greasyfork.org";
 
-// 記憶體快取：自動從腳本 4 同步最新網域與 Token（每 1 小時更新一次）
-let cachedUpstream = { host: "", token: "", ts: 0 };
+// 腳本 4 的官方更新直鏈（多來源備援，確保永遠能讀到最新原始碼）
+const UPSTREAM_SCRIPT_SOURCES = [
+  "https://greasyfork.org",
+  "https://sleazyfork.org"
+];
 
-async function getDynamicUpstreamConfig() {
+let cachedUpstream = { host: "", token: "", ts: 0, source: "" };
+
+// 自動從腳本 4 原始碼解析最新網域與 Token
+function extractCredentialsFromScript(code) {
+  if (!code || code.length < 1000) return null;
+
+  // 1. 解析主機網域（匹配 String.fromCharCode.apply(null, [106,97,118...])）
+  let host = "";
+  const hostMatches = [...code.matchAll(/String\.fromCharCode\.apply\(null,\[([\d,\s]+)\]\)/g)];
+  for (const m of hostMatches) {
+    const decoded = m
+      .split(",")
+      .map((n) => String.fromCharCode(Number(n.trim())))
+      .join("");
+    if (decoded.includes(".") && !decoded.startsWith("worker.") && decoded.length >= 6) {
+      host = decoded;
+      break;
+    }
+  }
+
+  // 2. 解析 Token（匹配 XOR 37 編碼陣列）
+  let token = "";
+  const tokenMatch =
+    code.match(/token\(\)\{return\[([\d,\s]+)\]\.map/) ||
+    code.match(/\[([\d,\s]{40,})\]\.map\(\w+=>String\.fromCharCode\(\w+\^37\)\)/);
+
+  if (tokenMatch) {
+    token = tokenMatch
+      .split(",")
+      .map((n) => String.fromCharCode(Number(n.trim()) ^ 37))
+      .join("");
+  }
+
+  return host && token ? { host, token } : null;
+}
+
+async function getDynamicUpstreamConfig(forceRefresh = false) {
   const now = Date.now();
-  if (cachedUpstream.host && cachedUpstream.token && now - cachedUpstream.ts < 3600000) {
+  // 每 30 分鐘自動檢查一次原作者是否更新代碼
+  if (!forceRefresh && cachedUpstream.host && cachedUpstream.token && now - cachedUpstream.ts < 1800000) {
     return cachedUpstream;
   }
 
-  try {
-    const res = await fetch(UPSTREAM_SCRIPT_URL, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    if (res.ok) {
-      const code = await res.text();
-      // 提取腳本 4 裡的 host 陣列與 token 陣列（XOR 37 編碼）
-      const hostMatch = code.match(/host:String\.fromCharCode\.apply\(null,\[([\d,\s]+)\]\)/);
-      const tokenMatch = code.match(/token\(\)\{return\[([\d,\s]+)\]\.map/);
+  for (const srcUrl of UPSTREAM_SCRIPT_SOURCES) {
+    try {
+      const res = await fetch(`${srcUrl}?_t=${Math.floor(now / 60000)}`, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Cache-Control": "no-cache",
+        },
+      });
+      if (!res.ok) continue;
 
-      if (hostMatch && tokenMatch) {
-        const decodeXor37 = (csv) =>
-          csv
-            .split(",")
-            .map((n) => String.fromCharCode(Number(n.trim()) ^ 37))
-            .join("");
-
-        const host = hostMatch.at(1)
-          .split(",")
-          .map((n) => String.fromCharCode(Number(n.trim())))
-          .join("");
-        const token = decodeXor37(tokenMatch.at(1));
-
-        if (host && token) {
-          cachedUpstream = { host, token, ts: now };
-          return cachedUpstream;
-        }
+      const scriptText = await res.text();
+      const parsed = extractCredentialsFromScript(scriptText);
+      if (parsed) {
+        cachedUpstream = {
+          host: parsed.host,
+          token: parsed.token,
+          ts: now,
+          source: srcUrl,
+        };
+        return cachedUpstream;
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
 
-  // 若 GreasyFork 暫時無法連線，回退至目前已知有效設定
   return {
     host: cachedUpstream.host || "javxy.cc.cd",
     token: cachedUpstream.token || "AmdNGl8XOlAFBB6B7cL36aT3U+560/12F4j83eZ",
     ts: now,
+    source: "fallback",
   };
 }
 
@@ -66,50 +98,71 @@ export default async function handler(request) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 1. 演員三圍資料介面（自動同步腳本 4 最新 API 轉發）
+  // 0. 自動同步狀態檢查介面：GET /api/sync-status
+  if (url.pathname === "/api/sync-status") {
+    const force = url.searchParams.get("refresh") === "1";
+    const cfg = await getDynamicUpstreamConfig(force);
+    return jsonOut(
+      {
+        status: "ok",
+        syncedHost: cfg.host,
+        tokenPreview: cfg.token ? `${cfg.token.slice(0, 6)}...` : "none",
+        lastSyncTime: new Date(cfg.ts).toISOString(),
+        source: cfg.source,
+      },
+      200,
+      corsHeaders
+    );
+  }
+
+  // 1. 演員三圍資料介面（自動追蹤最新 API 並轉發）
   if (url.pathname === "/api/actors") {
     if (request.headers.get("X-Javxy-Token") !== SECRET_TOKEN) {
       return jsonOut({ error: "Unauthorized" }, 401, corsHeaders);
     }
 
     const bodyText = await request.text();
-    const upstream = await getDynamicUpstreamConfig();
     const principal = request.headers.get("X-Javxy-Principal") || `anon_${Date.now().toString(36)}`;
 
-    try {
-      const upRes = await fetch(`https://${upstream.host}/api/actors?client=laosiji-new`, {
-        method: "POST",
-        headers: {
-          "Accept": "application/json,text/plain,*/*",
-          "Content-Type": "application/json",
-          "X-Javxy-Token": upstream.token,
-          "X-Javxy-Principal": principal,
-        },
-        body: bodyText,
-      });
-
-      if (upRes.ok) {
-        const data = await upRes.text();
-        return new Response(data, {
-          status: 200,
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const upstream = await getDynamicUpstreamConfig(attempt === 1);
+      try {
+        const upRes = await fetch(`https://${upstream.host}/api/actors?client=laosiji-new`, {
+          method: "POST",
           headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Cache-Control": "public, max-age=86400",
-            ...corsHeaders,
+            "Accept": "application/json,text/plain,*/*",
+            "Content-Type": "application/json",
+            "X-Javxy-Token": upstream.token,
+            "X-Javxy-Principal": principal,
           },
+          body: bodyText,
         });
-      }
-    } catch (e) {}
+
+        if (upRes.ok) {
+          const data = await upRes.text();
+          return new Response(data, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Cache-Control": "public, max-age=86400",
+              ...corsHeaders,
+            },
+          });
+        }
+
+        if (upRes.status === 401 || upRes.status === 403) continue;
+        break;
+      } catch (e) {}
+    }
 
     return jsonOut({ profiles: [] }, 200, corsHeaders);
   }
-
   // 2. 中轉狀態檢查
   if (url.pathname === "/api/trailers/proxy/status") {
     return jsonOut({ enabled: true }, 200, corsHeaders);
   }
 
-  // 3. 串流反向代理（支援動態 Referer 與 HLS 加密金鑰轉發）
+  // 3. 串流反向代理
   if (url.pathname === "/proxy") {
     const qToken = url.searchParams.get("token");
     const hToken = request.headers.get("X-Javxy-Token");
@@ -123,7 +176,7 @@ export default async function handler(request) {
     return proxyStream(request, url.origin, targetUrl, corsHeaders);
   }
 
-  // 4. 預告片查詢（優先轉發腳本 4 最新聚合源，失敗時自動回退 JavTrailers）
+  // 4. 預告片查詢（同樣具備遇 401/403 自動重抓腳本 4 最新代碼的機制）
   const segs = url.pathname.split("/").filter(Boolean);
   if (segs.at(0) !== "api" || segs.at(1) !== "trailers" || !segs.at(2)) {
     return jsonOut({ error: "Not Found" }, 404, corsHeaders);
@@ -134,35 +187,40 @@ export default async function handler(request) {
   }
 
   const code = decodeURIComponent(segs.at(2)).trim().toUpperCase();
-  const upstream = await getDynamicUpstreamConfig();
   const principal = request.headers.get("X-Javxy-Principal") || `anon_${Date.now().toString(36)}`;
 
-  try {
-    const upUrl = new URL(`https://${upstream.host}/api/trailers/${encodeURIComponent(code)}`);
-    url.searchParams.forEach((v, k) => upUrl.searchParams.set(k, v));
-    upUrl.searchParams.set("client", "laosiji-new");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const upstream = await getDynamicUpstreamConfig(attempt === 1);
+    try {
+      const upUrl = new URL(`https://${upstream.host}/api/trailers/${encodeURIComponent(code)}`);
+      url.searchParams.forEach((v, k) => upUrl.searchParams.set(k, v));
+      upUrl.searchParams.set("client", "laosiji-new");
 
-    const upRes = await fetch(upUrl.href, {
-      headers: {
-        "Accept": "application/json,text/plain,*/*",
-        "X-Javxy-Token": upstream.token,
-        "X-Javxy-Principal": principal,
-      },
-    });
-
-    if (upRes.ok) {
-      const data = await upRes.text();
-      return new Response(data, {
-        status: 200,
+      const upRes = await fetch(upUrl.href, {
         headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          ...corsHeaders,
+          "Accept": "application/json,text/plain,*/*",
+          "X-Javxy-Token": upstream.token,
+          "X-Javxy-Principal": principal,
         },
       });
-    }
-  } catch (e) {}
 
-  // 備援：若上游無結果，改用本地 JavTrailers 抓取
+      if (upRes.ok) {
+        const data = await upRes.text();
+        return new Response(data, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            ...corsHeaders,
+          },
+        });
+      }
+
+      if (upRes.status === 401 || upRes.status === 403) continue;
+      break;
+    } catch (e) {}
+  }
+
+  // 備援：本地 JavTrailers 抓取
   const rawVideoUrl = await fetchFromJavTrailers(code);
   if (!rawVideoUrl) {
     return jsonOut({ error: "Trailer not found", code }, 404, corsHeaders);
