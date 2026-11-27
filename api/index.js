@@ -232,14 +232,22 @@ async function fetchActorProfile(name) {
   return null;
 }
 
-// 串流反向代理
+// 串流反向代理（支援動態 Referer 與 HLS 加密金鑰轉發）
 async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
+  const targetObj = new URL(targetUrl);
   const reqHeaders = new Headers();
   reqHeaders.set(
     "User-Agent",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
-  reqHeaders.set("Referer", "https://javtrailers.com");
+
+  // 依據影片實際主機動態設定 Referer，避免被 DMM 或其他 CDN 阻擋
+  if (targetObj.hostname.includes("dmm.co.jp")) {
+    reqHeaders.set("Referer", "https://dmm.co.jp");
+  } else {
+    reqHeaders.set("Referer", `${targetObj.origin}/`);
+  }
+
   const range = request.headers.get("Range");
   if (range) reqHeaders.set("Range", range);
 
@@ -250,13 +258,21 @@ async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
 
   if (targetUrl.includes(".m3u8") && upstream.ok) {
     const m3u8Text = await upstream.text();
+    const toProxy = (rawPath) => {
+      const absUrl = new URL(rawPath, targetUrl).href;
+      return `${serverOrigin}/proxy?token=${SECRET_TOKEN}&url=${encodeURIComponent(absUrl)}`;
+    };
+
     const rewritten = m3u8Text
       .split("\n")
       .map((line) => {
         const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) return line;
-        const absUrl = new URL(trimmed, targetUrl).href;
-        return `${serverOrigin}/proxy?token=${SECRET_TOKEN}&url=${encodeURIComponent(absUrl)}`;
+        if (!trimmed) return line;
+        // 轉發 #EXT-X-KEY 或 #EXT-X-MAP 標籤內的 URI 加密金鑰與初始化片段
+        if (trimmed.startsWith("#")) {
+          return line.replace(/URI="([^"]+)"/gi, (_, uri) => `URI="${toProxy(uri)}"`);
+        }
+        return toProxy(trimmed);
       })
       .join("\n");
 
@@ -272,7 +288,6 @@ async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
   outHeaders.set("Cache-Control", "public, max-age=86400");
   return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
 }
-
 // 抓取 JavTrailers 預告片
 async function fetchFromJavTrailers(code) {
   const headers = {
