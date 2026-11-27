@@ -1,5 +1,6 @@
 export const config = {
   runtime: "edge",
+  regions: ["hnd1"],
 };
 
 const SECRET_TOKEN = "MY_TOKEN_123";
@@ -16,7 +17,7 @@ export default async function handler(request) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 1. 演員三圍資料介面：POST /api/actors
+  // 新增：演員三圍資料介面 POST /api/actors
   if (url.pathname === "/api/actors") {
     if (request.headers.get("X-Javxy-Token") !== SECRET_TOKEN) {
       return jsonOut({ error: "Unauthorized" }, 401, corsHeaders);
@@ -38,12 +39,10 @@ export default async function handler(request) {
     });
   }
 
-  // 2. 中轉狀態檢查
   if (url.pathname === "/api/trailers/proxy/status") {
     return jsonOut({ enabled: true }, 200, corsHeaders);
   }
 
-  // 3. 串流反向代理：/proxy?token=MY_TOKEN_123&url=...
   if (url.pathname === "/proxy") {
     if (url.searchParams.get("token") !== SECRET_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
@@ -55,7 +54,6 @@ export default async function handler(request) {
     return proxyStream(request, url.origin, targetUrl, corsHeaders);
   }
 
-  // 4. 預告片查詢：/api/trailers/番号
   const segs = url.pathname.split("/").filter(Boolean);
   const p1 = segs.shift();
   const p2 = segs.shift();
@@ -92,7 +90,7 @@ export default async function handler(request) {
   }, 200, corsHeaders);
 }
 
-// 從 SeesaaWiki 抓取演員生日、身高、三圍與罩杯
+// 新增：從 SeesaaWiki 抓取演員生日、身高、三圍與罩杯
 async function fetchActorFromSeesaa(name) {
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
