@@ -1,6 +1,5 @@
 export const config = {
   runtime: "edge",
-  regions: ["hnd1"],
 };
 
 const SECRET_TOKEN = "MY_TOKEN_123";
@@ -9,7 +8,7 @@ export default async function handler(request) {
   const url = new URL(request.url);
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, X-Javxy-Token, X-Javxy-Principal, Range",
   };
 
@@ -17,10 +16,34 @@ export default async function handler(request) {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // 1. 演員三圍資料介面：POST /api/actors
+  if (url.pathname === "/api/actors") {
+    if (request.headers.get("X-Javxy-Token") !== SECRET_TOKEN) {
+      return jsonOut({ error: "Unauthorized" }, 401, corsHeaders);
+    }
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {}
+    const names = Array.isArray(body.names) ? body.names.slice(0, 10) : [];
+    const profiles = await Promise.all(names.map(async function (rawName) {
+      const name = String(rawName || "").trim();
+      if (!name) return { name: rawName, error: "empty" };
+      const profile = await fetchActorFromSeesaa(name);
+      return profile ? { name: name, profile: profile } : { name: name, error: "not_found" };
+    }));
+    return jsonOut({ profiles: profiles }, 200, {
+      ...corsHeaders,
+      "Cache-Control": "public, max-age=86400",
+    });
+  }
+
+  // 2. 中轉狀態檢查
   if (url.pathname === "/api/trailers/proxy/status") {
     return jsonOut({ enabled: true }, 200, corsHeaders);
   }
 
+  // 3. 串流反向代理：/proxy?token=MY_TOKEN_123&url=...
   if (url.pathname === "/proxy") {
     if (url.searchParams.get("token") !== SECRET_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
@@ -32,6 +55,7 @@ export default async function handler(request) {
     return proxyStream(request, url.origin, targetUrl, corsHeaders);
   }
 
+  // 4. 預告片查詢：/api/trailers/番号
   const segs = url.pathname.split("/").filter(Boolean);
   const p1 = segs.shift();
   const p2 = segs.shift();
@@ -66,6 +90,68 @@ export default async function handler(request) {
       "720p": proxiedUrl,
     },
   }, 200, corsHeaders);
+}
+
+// 從 SeesaaWiki 抓取演員生日、身高、三圍與罩杯
+async function fetchActorFromSeesaa(name) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9",
+  };
+  const wikiHost = "https://" + "seesaawiki.jp";
+  try {
+    const sRes = await fetch(wikiHost + "/w/sougouwiki/search?keywords=" + encodeURIComponent(name), { headers: headers });
+    if (!sRes.ok) return null;
+    const sHtml = await sRes.text();
+
+    const idx = sHtml.indexOf("/w/sougouwiki/d/");
+    if (idx === -1) return null;
+
+    let endIdx = idx + 16;
+    while (endIdx < sHtml.length) {
+      const ch = sHtml.charAt(endIdx);
+      if (ch === '"' || ch === "'" || ch === "?" || ch === "#" || ch === " " || ch === ">") break;
+      endIdx++;
+    }
+    const detailPath = sHtml.slice(idx, endIdx);
+    const dRes = await fetch(wikiHost + detailPath, { headers: headers });
+    if (!dRes.ok) return null;
+
+    const dHtml = await dRes.text();
+    const text = dHtml.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
+    const profile = { name: name };
+
+    const bMatch = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (bMatch) {
+      profile.birthday = bMatch.at(1) + "-" + bMatch.at(2).padStart(2, "0") + "-" + bMatch.at(3).padStart(2, "0");
+    }
+
+    const hMatch = text.match(/(\d{3})\s*cm/i);
+    if (hMatch) profile.heightCm = hMatch.at(1);
+
+    const wMatch = text.match(/(\d{2,3})\s*kg/i);
+    if (wMatch) profile.weightKg = wMatch.at(1);
+
+    const bwhMatch = text.match(/B(\d{2,3})\s*(?:[（(]([A-Z])[）)])?\s*[-/／]\s*W(\d{2,3})\s*[-/／]\s*H(\d{2,3})/i);
+    if (bwhMatch) {
+      profile.bustCm = bwhMatch.at(1);
+      if (bwhMatch.at(2)) profile.cup = bwhMatch.at(2).toUpperCase();
+      profile.waistCm = bwhMatch.at(3);
+      profile.hipCm = bwhMatch.at(4);
+    }
+
+    if (!profile.cup) {
+      const cMatch = text.match(/[（(]([A-Z])カップ[）)]|([A-Z])カップ/i);
+      if (cMatch) profile.cup = (cMatch.at(1) || cMatch.at(2) || "").toUpperCase();
+    }
+
+    const bloodMatch = text.match(/血液型\s*[:：]?\s*(AB|A|B|O)型?/i);
+    if (bloodMatch) profile.bloodType = bloodMatch.at(1).toUpperCase();
+
+    return (profile.birthday || profile.heightCm || profile.bustCm) ? profile : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function proxyStream(request, serverOrigin, targetUrl, corsHeaders) {
